@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"os"
 	"strings"
 	"time"
@@ -22,6 +23,7 @@ const globalStream = "idx|__global"
 const globalPosKey = "pos|__global"
 const family = "x"
 const RFC3339Mili = "2006-01-02T15:04:05.999Z07:00"
+const nPart = 1
 
 type devTokenSource struct{}
 
@@ -49,6 +51,17 @@ func panicIf(err error) {
 
 func key_(parts ...string) string {
 	return strings.Join(parts, "|")
+}
+
+func streamPartition(stream string) string {
+	h := fnv.New64()
+	h.Write([]byte(stream))
+	s := h.Sum64()
+	return fmt.Sprintf("%02x", s%nPart)
+}
+
+func globalKey(stream string, position int64) string {
+	return key_(globalStream+"#"+streamPartition(stream), int64ToHex(position))
 }
 
 type Message struct {
@@ -154,12 +167,12 @@ func NewPublishFn(ctx context.Context, table *bigtable.Table) PublishFn {
 	}
 
 	reserveGlobalPos := func(stream string) int64 {
-		lastPos := lastStreamPos("__global")
+		lastPos := lastStreamPos("__global#" + streamPartition(stream))
 		mut := bigtable.NewMutation()
 		mut.Set(family, "stream", bigtable.Now(), []byte(stream))
 		for attempt := int64(1); attempt <= 10000; attempt++ {
 			pos := lastPos + attempt
-			key := key_(globalStream, int64ToHex(pos))
+			key := globalKey(stream, pos)
 			ok, err := applyIfNotExists(key, mut)
 			if err != nil {
 				log.Error().Err(err)
@@ -167,6 +180,8 @@ func NewPublishFn(ctx context.Context, table *bigtable.Table) PublishFn {
 			}
 			if ok {
 				log.Debug().Int64("pos", pos).Msg("reserved global position")
+				mut := bigtable.NewMutation()
+				writeLastStreamPos("__global#"+streamPartition(stream), pos)
 				return pos
 			}
 			log.Warn().Int64("pos", pos).Msg("couldn't reserve global position")
@@ -177,10 +192,10 @@ func NewPublishFn(ctx context.Context, table *bigtable.Table) PublishFn {
 		return 0
 	}
 
-	releaseGlobalPosition := func(pos int64) {
+	releaseGlobalPosition := func(pos int64, stream string) {
 		del := bigtable.NewMutation()
 		del.DeleteRow()
-		key := key_(globalStream, int64ToHex(pos))
+		key := globalKey(stream, pos)
 		table.Apply(ctx, key, del)
 	}
 
@@ -244,7 +259,7 @@ func NewPublishFn(ctx context.Context, table *bigtable.Table) PublishFn {
 					Msg("wrote message to stream position")
 				return
 			}
-			releaseGlobalPosition(globalPos)
+			releaseGlobalPosition(globalPos, stream)
 			if err != nil {
 				return
 			}
@@ -298,7 +313,7 @@ func NewPublishFn(ctx context.Context, table *bigtable.Table) PublishFn {
 				streamKey(stream, streamVer), encodedData, encodedMeta,
 				streamVer, globalPos)
 			if !ok || err != nil {
-				releaseGlobalPosition(globalPos)
+				releaseGlobalPosition(globalPos, stream)
 				if !ok {
 					panic("could not write version because it exists")
 				}
@@ -317,9 +332,9 @@ func NewPublishFn(ctx context.Context, table *bigtable.Table) PublishFn {
 		emptyMut := bigtable.NewMutation()
 		emptyMut.Set(family, "_", bigtable.Now(), []byte{})
 		table.ApplyBulk(ctx, []string{
-			key_(globalStream, int64ToHex(globalPos), stream),
+			globalKey(stream, globalPos),
 			lastStreamPosKey(stream, streamVer),
-			lastStreamPosKey("__global", globalPos),
+			lastStreamPosKey("__global#"+streamPartition(stream), globalPos),
 		}, []*bigtable.Mutation{msgMut, emptyMut, emptyMut})
 		// return table.Apply(ctx, lastStreamPosKey(stream, pos), mut)
 
@@ -556,17 +571,17 @@ func main() {
 	// go func() { publish("customer-1234", data, meta, nil) }()
 	// go func() { publish("customer-1234", data, meta, nil) }()
 	// go func() { publish("customer-1234", data, meta, nil) }()
-	// for i := 0; i < 1; i++ {
-	// 	for j := 0; j < 8; j++ {
-	// 		name := fmt.Sprintf("customer-%[1]x%[1]x%[1]x%[1]x", j)
-	// 		go func() {
-	// 			for k := 0; k < 4; k++ {
-	// 				publish(name, data, meta, nil)
-	// 			}
-	// 		}()
-	// 	}
-	// }
-	// time.Sleep(1000 * time.Millisecond)
+	for i := 0; i < 1; i++ {
+		for j := 0; j < 16; j++ {
+			name := fmt.Sprintf("customer-%[1]x%[1]x%[1]x%[1]x", j)
+			go func() {
+				for k := 0; k < 4; k++ {
+					publish(name, data, meta, nil)
+				}
+			}()
+		}
+	}
+	time.Sleep(1000 * time.Millisecond)
 
 	// UTIL
 	logMessage := func(msg *Message) {
@@ -670,5 +685,5 @@ func main() {
 		}, bigtable.RowFilter(bigtable.LatestNFilter(1)))
 	}
 	_ = printDebug
-	// printDebug()
+	printDebug()
 }
