@@ -47,6 +47,10 @@ func panicIf(err error) {
 	}
 }
 
+func key_(parts ...string) string {
+	return strings.Join(parts, "|")
+}
+
 type Message struct {
 	Stream    string `json:"stream"`
 	Version   int64  `json:"version"`
@@ -120,11 +124,13 @@ func NewPublishFn(ctx context.Context, table *bigtable.Table) PublishFn {
 		}
 		parts := strings.Split(rowKey, "|")
 		if len(parts) < 4 {
-			panic(fmt.Errorf(
-				"last position key didn't have enough parts: %s", rowKey))
+			log.Panic().Str("key", rowKey).
+				Msg("last position key didn't have enough parts")
 		}
 		pos, err := hexToInt64(parts[3])
-		panicIf(err)
+		if err != nil {
+			log.Panic().Str("key", rowKey).Err(err)
+		}
 		truePos := (1<<63 - 1) - pos
 		return truePos
 	}
@@ -139,22 +145,57 @@ func NewPublishFn(ctx context.Context, table *bigtable.Table) PublishFn {
 		return int64(binary.BigEndian.Uint64(col.Value))
 	}
 
-	writeIfNotExists := func(
-		key string, data, meta []byte, pos int64) (didWrite bool, err error) {
-		//
-		mut := bigtable.NewMutation()
-		mut.Set(family, "data", bigtable.ServerTime, data)
-		mut.Set(family, "meta", bigtable.ServerTime, meta)
-		mut.Set(family, "pos", bigtable.ServerTime, int64ToByte(pos))
+	applyIfNotExists := func(key string, mut *bigtable.Mutation) (ok bool, err error) {
+		var mutRes bool
 		cond := bigtable.NewCondMutation(bigtable.LatestNFilter(1), nil, mut)
-		var mutationResult bool
 		err = table.Apply(
-			ctx, key, cond, bigtable.GetCondMutationResult(&mutationResult))
-		didWrite = !mutationResult
-		return
+			ctx, key, cond, bigtable.GetCondMutationResult(&mutRes))
+		return !mutRes, err
 	}
 
-	mustWriteMessage := func(stream string, data, meta []byte) (
+	reserveGlobalPos := func(stream string) int64 {
+		lastPos := lastStreamPos("__global")
+		mut := bigtable.NewMutation()
+		mut.Set(family, "stream", bigtable.Now(), []byte(stream))
+		for attempt := int64(1); attempt <= 10000; attempt++ {
+			pos := lastPos + attempt
+			key := key_(globalStream, int64ToHex(pos))
+			ok, err := applyIfNotExists(key, mut)
+			if err != nil {
+				log.Error().Err(err)
+				return 0
+			}
+			if ok {
+				log.Debug().Int64("pos", pos).Msg("reserved global position")
+				return pos
+			}
+			log.Warn().Int64("pos", pos).Msg("couldn't reserve global position")
+			// time.Sleep(20 * time.Millisecond)
+		}
+		log.Error().Int("maxAttempts", 10000).
+			Msg("exceeded max attempts to reserve position")
+		return 0
+	}
+
+	releaseGlobalPosition := func(pos int64) {
+		del := bigtable.NewMutation()
+		del.DeleteRow()
+		key := key_(globalStream, int64ToHex(pos))
+		table.Apply(ctx, key, del)
+	}
+
+	writeMessageIfNotExists := func(
+		key string, data, meta []byte, ver, pos int64) (didWrite bool, err error) {
+		//
+		mut := bigtable.NewMutation()
+		mut.Set(family, "data", bigtable.Now(), data)
+		mut.Set(family, "meta", bigtable.Now(), meta)
+		mut.Set(family, "ver", bigtable.Now(), int64ToByte(ver))
+		mut.Set(family, "pos", bigtable.Now(), int64ToByte(pos))
+		return applyIfNotExists(key, mut)
+	}
+
+	mustWriteMessageV0 := func(stream string, data, meta []byte) (
 		globalPos, streamVer int64, err error) {
 		var ok bool
 		attempt := 1
@@ -163,7 +204,8 @@ func NewPublishFn(ctx context.Context, table *bigtable.Table) PublishFn {
 		for {
 			streamVer++
 			globalPos = nextGlobalPos()
-			ok, err = writeIfNotExists(streamKey(stream, streamVer), data, meta, globalPos)
+			ok, err = writeMessageIfNotExists(
+				streamKey(stream, streamVer), data, meta, streamVer, globalPos)
 			if ok {
 				log.Debug().
 					Str("stream", stream).
@@ -186,27 +228,60 @@ func NewPublishFn(ctx context.Context, table *bigtable.Table) PublishFn {
 			}
 		}
 	}
-
-	writeCategoryMessage := func(
-		pos int64, category, streamKey string, data, meta []byte) error {
-		//
-		key := "cat|" + category + "|" + int64ToHex(pos) + "|" + streamKey
-		_, err := writeIfNotExists(key, data, meta, pos)
-		return err
+	mustWriteMessageV1 := func(stream string, data, meta []byte) (
+		globalPos, streamVer int64, err error) {
+		var ok bool
+		streamVer = lastStreamPos(stream)
+		for i := 1; i < 1000; i++ {
+			streamVer++
+			globalPos = reserveGlobalPos(stream)
+			ok, err = writeMessageIfNotExists(
+				streamKey(stream, streamVer), data, meta, streamVer, globalPos)
+			if ok {
+				log.Debug().
+					Str("stream", stream).
+					Int64("ver", streamVer).
+					Msg("wrote message to stream position")
+				return
+			}
+			releaseGlobalPosition(globalPos)
+			if err != nil {
+				return
+			}
+			log.Warn().
+				Str("stream", stream).
+				Int64("ver", streamVer).
+				Msg("could not write message to stream position")
+		}
+		log.Error().Int("maxAttempts", 10000).
+			Msg("exceeded max attempts to reserve position")
+		return
 	}
+
+	// writeCategoryMessage := func(
+	// 	pos int64, category, streamKey string, data, meta []byte) error {
+	// 	//
+	// 	key := "cat|" + category + "|" + int64ToHex(pos) + "|" + streamKey
+	// 	_, err := writeMessageIfNotExists(key, data, meta, 0, pos)
+	// 	return err
+	// }
 
 	writeGlobalPos := func(pos int64, streamKey string) error {
 		mut := bigtable.NewMutation()
-		mut.Set(family, "key", bigtable.ServerTime, []byte(streamKey))
+		mut.Set(family, "key", bigtable.Now(), []byte(streamKey))
 		return table.Apply(ctx, globalStream+"|"+int64ToHex(pos), mut)
 	}
 
 	writeLastStreamPos := func(stream string, pos int64) error {
 		mut := bigtable.NewMutation()
-		mut.Set(family, "_", bigtable.ServerTime, []byte{})
+		mut.Set(family, "_", bigtable.Now(), []byte{})
 		return table.Apply(ctx, lastStreamPosKey(stream, pos), mut)
 	}
 
+	_ = mustWriteMessageV0
+	// _ = writeCategoryMessage
+	_ = writeGlobalPos
+	_ = writeLastStreamPos
 	return func(stream string, data, meta interface{}, expectedVer *int64) {
 		encodedData, err := json.Marshal(data)
 		panicIf(err)
@@ -215,19 +290,50 @@ func NewPublishFn(ctx context.Context, table *bigtable.Table) PublishFn {
 
 		var globalPos, streamVer int64
 		if expectedVer == nil {
-			globalPos, streamVer, err = mustWriteMessage(
+			globalPos, streamVer, err = mustWriteMessageV1(
 				stream, encodedData, encodedMeta)
 		} else {
-			// TODO
+			globalPos = reserveGlobalPos(stream)
+			ok, err := writeMessageIfNotExists(
+				streamKey(stream, streamVer), encodedData, encodedMeta,
+				streamVer, globalPos)
+			if !ok || err != nil {
+				releaseGlobalPosition(globalPos)
+				if !ok {
+					panic("could not write version because it exists")
+				}
+				if err != nil {
+					panic(err)
+				}
+			}
 		}
-		err = writeCategoryMessage(
-			globalPos, streamCategory(stream), streamKey(stream, streamVer),
-			encodedData, encodedMeta)
-		panicIf(err)
-		err = writeGlobalPos(globalPos, streamKey(stream, streamVer))
-		panicIf(err)
-		err = writeLastStreamPos(stream, streamVer)
-		panicIf(err)
+
+		msgMut := bigtable.NewMutation()
+		msgMut.Set(family, "data", bigtable.Now(), encodedData)
+		msgMut.Set(family, "meta", bigtable.Now(), encodedMeta)
+		msgMut.Set(family, "pos", bigtable.Now(), int64ToByte(globalPos))
+		msgMut.Set(family, "ver", bigtable.Now(), int64ToByte(streamVer))
+		msgMut.Set(family, "key", bigtable.Now(), []byte(streamKey(stream, streamVer)))
+		emptyMut := bigtable.NewMutation()
+		emptyMut.Set(family, "_", bigtable.Now(), []byte{})
+		table.ApplyBulk(ctx, []string{
+			key_(globalStream, int64ToHex(globalPos), stream),
+			lastStreamPosKey(stream, streamVer),
+			lastStreamPosKey("__global", globalPos),
+		}, []*bigtable.Mutation{msgMut, emptyMut, emptyMut})
+		// return table.Apply(ctx, lastStreamPosKey(stream, pos), mut)
+
+		// mutLastGlobalPos := bigtable.NewMutation()
+		// err = writeCategoryMessage(
+		// 	globalPos, streamCategory(stream), streamKey(stream, streamVer),
+		// 	encodedData, encodedMeta)
+		// panicIf(err)
+		// err = writeGlobalPos(globalPos, streamKey(stream, streamVer))
+		// panicIf(err)
+		// err = writeLastStreamPos(stream, streamVer)
+		// panicIf(err)
+		// err = writeLastStreamPos("__global", globalPos)
+		// panicIf(err)
 	}
 }
 
@@ -277,6 +383,9 @@ func streamNameFromKey(key string) string {
 	if len(parts) >= 2 && parts[0] == "msg" {
 		return parts[1]
 	}
+	if len(parts) >= 4 && parts[1] == "__global" {
+		return parts[3]
+	}
 	if len(parts) >= 5 && parts[0] == "cat" {
 		return parts[4]
 	}
@@ -297,6 +406,8 @@ func rowToMessage(row bigtable.Row) (*Message, error) {
 			msg.MetaBytes = col.Value
 		case family + ":pos":
 			msg.Position = byteToInt64(col.Value)
+		case family + ":ver":
+			msg.Version = byteToInt64(col.Value)
 		}
 	}
 	parts := strings.Split(row.Key(), "|")
@@ -328,6 +439,7 @@ func readStreamPattern(ctx context.Context, table *bigtable.Table,
 	if err != nil || key == "" {
 		return nil, err
 	}
+	log.Debug().Str("key", key).Msg("scanning")
 
 	messages := make([]*Message, 0, finalOpts.rowLimit)
 	var iterErr error
@@ -377,6 +489,18 @@ func NewReadCategoryFn(ctx context.Context, table *bigtable.Table) ReadCategoryF
 		messages := make([]*Message, 0, finalOpts.rowLimit)
 		var iterErr error
 		rowIter := func(row bigtable.Row) bool {
+			hasData := false
+			for _, col := range row[family] {
+				if col.Column == family+":data" {
+					hasData = true
+					break
+				}
+			}
+
+			if !hasData {
+				return false
+			}
+
 			var msg *Message
 			msg, iterErr = rowToMessage(row)
 			if iterErr != nil {
@@ -385,8 +509,8 @@ func NewReadCategoryFn(ctx context.Context, table *bigtable.Table) ReadCategoryF
 			messages = append(messages, msg)
 			return true
 		}
-		rangeStart := "cat|" + cat + "|" + int64ToHex(startPos) + "|"
-		pattern := `^cat\|` + cat + `\|`
+		rangeStart := key_(globalStream, int64ToHex(startPos), cat)
+		pattern := `^idx\|__global\|[0-9a-f]{16}\|` + cat + `-`
 		err := table.ReadRows(ctx,
 			bigtable.InfiniteRange(rangeStart), rowIter,
 			bigtable.RowFilter(
@@ -427,8 +551,22 @@ func main() {
 	meta := map[string]string{
 		"at": time.Now().UTC().Format(RFC3339Mili),
 	}
-	publish("customer-1234", data, meta, nil)
-	publish("customer-2345", data, meta, nil)
+	_, _ = data, meta
+	_ = publish
+	// go func() { publish("customer-1234", data, meta, nil) }()
+	// go func() { publish("customer-1234", data, meta, nil) }()
+	// go func() { publish("customer-1234", data, meta, nil) }()
+	// for i := 0; i < 1; i++ {
+	// 	for j := 0; j < 8; j++ {
+	// 		name := fmt.Sprintf("customer-%[1]x%[1]x%[1]x%[1]x", j)
+	// 		go func() {
+	// 			for k := 0; k < 4; k++ {
+	// 				publish(name, data, meta, nil)
+	// 			}
+	// 		}()
+	// 	}
+	// }
+	// time.Sleep(1000 * time.Millisecond)
 
 	// UTIL
 	logMessage := func(msg *Message) {
@@ -456,7 +594,7 @@ func main() {
 		return msgs, err
 	}
 
-	msgs, err := readStream("customer-1234", 3, LimitRows(5))
+	msgs, err := readStream("customer-1234", 0, LimitRows(5))
 	panicIf(err)
 	if len(msgs) == 0 {
 		log.Error().Msg("no messages found")
@@ -478,7 +616,7 @@ func main() {
 			Msg("read messages")
 		return msgs, err
 	}
-	msgs, err = readCategory("customer", 0, LimitRows(5))
+	msgs, err = readCategory("customer", 0)
 	panicIf(err)
 	if len(msgs) == 0 {
 		log.Error().Msg("no messages found")
@@ -491,27 +629,35 @@ func main() {
 	printDebug := func() {
 		table.ReadRows(ctx, bigtable.PrefixRange(""), func(row bigtable.Row) bool {
 			if strings.HasPrefix(row.Key(), globalStream) {
-				log.Printf("%s = %s", row.Key(), row[family][0].Value)
+				l := log.Debug()
+				for _, col := range row[family] {
+					l = l.Bytes(col.Column, col.Value)
+				}
+				l.Msg(row.Key())
 				return true
 			}
 			parts := strings.Split(row.Key(), "|")
 			if parts[0] == "msg" {
-				var data, meta []byte
+				var data, meta, pos, ver []byte
 				for _, col := range row[family] {
 					switch col.Column {
 					case family + ":data":
 						data = col.Value
 					case family + ":meta":
 						meta = col.Value
+					case family + ":pos":
+						pos = col.Value
+					case family + ":ver":
+						ver = col.Value
 					default:
 						log.Debug().Str("col", col.Column).Bytes("x", col.Value).
 							Msg("unknown column")
 					}
 				}
-				pos, _ := hexToInt64(parts[2])
 				log.Debug().
 					Str("stream", parts[1]).
-					Int64("pos", pos).
+					Bytes("ver", ver).
+					Bytes("pos", pos).
 					Str("data", string(data)).
 					Str("meta", string(meta)).
 					Msg("msg")
